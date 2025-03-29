@@ -1,0 +1,14 @@
+#!/bin/bash
+#SBATCH -J spmd_implicit
+#SBATCH -o out-spmd-implicit
+#SBATCH -e eo-spmd-implicit
+#SBATCH -n 1
+#SBATCH -c 41
+#SBATCH -t 1-00:00
+#SBATCH -p huce_bigmem
+#SBATCH --mem 2000000
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=qsong@g.harvard.edu
+ 
+module load matlab
+srun -c $SLURM_CPUS_PER_TASK matlab -nosplash -nodesktop -r "solve_evp_spmd"
