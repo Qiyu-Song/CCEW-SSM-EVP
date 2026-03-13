@@ -1,3 +1,5 @@
+function [MATRIX, wn_k, lat, lat_deg, z, ny, dt, second] = build_matrix(wavenumber_factor, dlat)
+
 %% build matrix for the EVP with given parameters
 %current parameters: wavenumber_factor, dlat
 
@@ -65,7 +67,8 @@ dm=double(tmp.dm);
 %weight variance by mass. Works best for vertically coherent signal in
 %that subdividing a layer into multiple layers that are coherent does
 %not change the answer.
-mass_weight=diag(sqrt([dm(1:26);2.5^2*dm(1:14)]));
+mw_vec = sqrt([dm(1:26); (2.5^2)*dm(1:14)]);
+mass_weight = spdiags(mw_vec, 0, numel(mw_vec), numel(mw_vec));
 
 % 1.4 meridional grids
 max_lat = 60; % degrees
@@ -115,75 +118,56 @@ nu = 0e5 * meter^2 / second;
 % assuming zero signal in higher latitudes than max_lat
 disp(['Start building matrix for ' num2str(wavenumber_factor)])
 
-% 4.1 auxiliary matrices
-%partial2_y_lat_to_lat
-partial2_y_lat_to_lat_single_lev=zeros(ny, ny);
-for i=2:ny-1
-    partial2_y_lat_to_lat_single_lev(i,i-1:i+1)=[1, -2, 1]/(dy*dy);
-end
-partial2_y_lat_to_lat_single_lev(1,1)=-2/(dy*dy);
-partial2_y_lat_to_lat_single_lev(1,2)=1/(dy*dy);
-partial2_y_lat_to_lat_single_lev(ny,ny-1)=1/(dy*dy);
-partial2_y_lat_to_lat_single_lev(ny,ny)=-2/(dy*dy);
-partial2_y_lat_to_lat=kron(partial2_y_lat_to_lat_single_lev,eye(26));
+% 4.1 auxiliary matrices (sparse)
+I26 = speye(26);
 
-%partial2_y_slat_to_slat
-partial2_y_slat_to_slat_single_lev=zeros(ny+1, ny+1);
-for i=2:ny
-    partial2_y_slat_to_slat_single_lev(i,i-1:i+1)=[1, -2, 1]/(dy*dy);
-end
-partial2_y_slat_to_slat_single_lev(1,1)=-2/(dy*dy);
-partial2_y_slat_to_slat_single_lev(1,2)=1/(dy*dy);
-partial2_y_slat_to_slat_single_lev(ny+1,ny)=1/(dy*dy);
-partial2_y_slat_to_slat_single_lev(ny+1,ny+1)=-2/(dy*dy);
-partial2_y_slat_to_slat=kron(partial2_y_slat_to_slat_single_lev,eye(26));
+% 1D meridional operators (sparse, consistent boundary stencils)
+D2_lat  = spdiags([ones(ny,1) -2*ones(ny,1) ones(ny,1)], -1:1, ny, ny) / (dy*dy);
+D2_slat = spdiags([ones(ny+1,1) -2*ones(ny+1,1) ones(ny+1,1)], -1:1, ny+1, ny+1) / (dy*dy);
+Dy_s2l  = spdiags([-ones(ny,1) ones(ny,1)], [0 1], ny, ny+1) / dy;
+Dy_l2s  = spdiags([-ones(ny+1,1) ones(ny+1,1)], [-1 0], ny+1, ny) / dy;
 
-%partial_y_slat_to_lat
-partial_y_slat_to_lat_single_lev=zeros(ny, ny+1);
-for i=1:ny
-    partial_y_slat_to_lat_single_lev(i,i:i+1)=[-1, 1]/dy;
-end
-partial_y_slat_to_lat=kron(partial_y_slat_to_lat_single_lev,eye(26));
+partial2_y_lat_to_lat   = kron(D2_lat,  I26);
+partial2_y_slat_to_slat = kron(D2_slat, I26);
+partial_y_slat_to_lat   = kron(Dy_s2l,  I26);
+partial_y_lat_to_slat   = kron(Dy_l2s,  I26);
 
-%partial_y_lat_to_slat
-partial_y_lat_to_slat_single_lev=zeros(ny+1, ny);
-for i=2:ny
-    partial_y_lat_to_slat_single_lev(i,i-1:i)=[-1, 1]/dy;
-end
-partial_y_lat_to_slat_single_lev(1,1)=1/dy;
-partial_y_lat_to_slat_single_lev(ny+1,ny)=-1/dy;
-partial_y_lat_to_slat=kron(partial_y_lat_to_slat_single_lev,eye(26));
+%compute w from dudz, dvdz (divergence on lat grid)
+m_to_int_u = -1j*wn_k*speye(26*ny);
+m_to_int_v = -partial_y_slat_to_lat;
 
-%compute w from dudz, dvdz
-m_to_int_u=-1j*wn_k*eye(26*ny);
-m_to_int_v=-1*partial_y_slat_to_lat;
-%build vertical laplacian
-for k=2:nT
-  adz(k)=z(k)-z(k-1);
-end
-adz(1)=2*z(1);
-adz(nT+1)=(z(nT+1)-z(nT));
-adz=adz';
+% build vertical laplacian (sparse) and integration operator
+adz_v = zeros(nT+1,1);
+adz_v(2:nT) = z(2:nT) - z(1:nT-1);
+adz_v(1)    = 2*z(1);
+adz_v(nT+1) = z(nT+1) - z(nT);
+aa = zeros(nT,1); bb = zeros(nT,1); cc = zeros(nT,1);
 for k=1:nT
-  aa(k)=adz(k+1)/(adz(k)+adz(k+1));
+  aa(k)=adz_v(k+1)/(adz_v(k)+adz_v(k+1));
   bb(k)=-1.;
-  cc(k)=adz(k)/(adz(k)+adz(k+1));
+  cc(k)=adz_v(k)/(adz_v(k)+adz_v(k+1));
 end
-%symmetric lower BC
+% symmetric lower BC
 aa(1)=0.;
-bb(1)=-(2*adz(2)+adz(1))/(adz(1)+adz(2));
-%symmetric upper BC
-bb(nT)=-(2*adz(nT)+adz(nT+1))/(adz(nT)+adz(nT+1));
+bb(1)=-(2*adz_v(2)+adz_v(1))/(adz_v(1)+adz_v(2));
+% symmetric upper BC
+bb(nT)=-(2*adz_v(nT)+adz_v(nT+1))/(adz_v(nT)+adz_v(nT+1));
 cc(nT)=0.;
-invL=inv(diag(aa(2:nT),-1)+diag(bb,0)+diag(cc(1:nT-1),1));
-m_int=kron(eye(ny), invL*diag(adz(1:nT).*adz(2:nT+1)/2));
+% note that spdiags uses different convention for sub/super-diagonal than diag
+sub = [aa(2:nT); 0];        % so -1 diagonal uses aa(2:nT)
+sup = [0; cc(1:nT-1)];      % so +1 diagonal uses cc(1:nT-1)
+tridiag_L = spdiags([sub bb sup], [-1 0 1], nT, nT);
+rhs_diag = spdiags(adz_v(1:nT).*adz_v(2:nT+1)/2, 0, nT, nT);
+Linv_rhs = tridiag_L \ rhs_diag;   % avoid inv(...)
+Linv_rhs = sparse(Linv_rhs);
+m_int = kron(speye(ny), Linv_rhs);
 W_u = m_int*m_to_int_u;
 W_v = m_int*m_to_int_v;
 
 % 4.2 main parts for matrix
 %x->x (memory)
-Lx_x = kron(eye(ny),A);
-damp_x = damping*kron(eye(ny),B*C*epsdt);
+Lx_x = kron(speye(ny), sparse(A));
+damp_x = damping*kron(speye(ny), sparse(B*C)*epsdt);
 %d(rhou)dz,d(rhov)dz->x (input)
 coef_t=t_wavebg(1:26)*0.;
 coef_q=q_wavebg(1:14)*0.;
@@ -193,32 +177,31 @@ coef_t=-(coef_t+ggr/Cp)./rho(1:26);
 coef_q(1)=(q_wavebg(2)-q_wavebg(1))/(z(2)-z(1));
 coef_q(2:14)=(q_wavebg(3:15)-q_wavebg(1:13))./(z(3:15)-z(1:13));
 coef_q=-coef_q./rho(1:14);
-coef_matrix=diag([coef_t; coef_q]);
-trans_w=eye(40, 26);
-trans_w(27:41:14*40)=1;
-matrix_1_5=B*coef_matrix*trans_w*dt;
-Lx_u = kron(eye(ny),matrix_1_5)*W_u;
-Lx_v = kron(eye(ny),matrix_1_5)*W_v;
-%d(rhov)dz->d(rhou)dz
-beta_v_on_u_single_lev=zeros(ny, ny+1);
-for i=1:ny
-    beta_v_on_u_single_lev(i, i:i+1)=[0.5,0.5]*beta*lat(i)*dt;
-end
-Lu_v = kron(beta_v_on_u_single_lev, eye(26));
-%d(rhou)dz->d(rhov)dz
-beta_u_on_v_single_lev=zeros(ny+1, ny);
-for i=2:ny
-    beta_u_on_v_single_lev(i, i-1:i)=[-0.5,-0.5]*beta*slat(i)*dt;
-end
-beta_u_on_v_single_lev(1, 1)=-0.5*beta*slat(1)*dt;
-beta_u_on_v_single_lev(ny+1, ny)=-0.5*beta*slat(ny+1)*dt;
-Lv_u = kron(beta_u_on_v_single_lev, eye(26));
+coef_matrix = spdiags([coef_t; coef_q], 0, 40, 40);
+trans_w = [speye(26); [speye(14) sparse(14,12)]];
+matrix_1_5 = sparse(B*coef_matrix*trans_w*dt);
+Lx_u = kron(speye(ny), matrix_1_5)*W_u;
+Lx_v = kron(speye(ny), matrix_1_5)*W_v;
+%d(rhov)dz->d(rhou)dz (Coriolis, sparse)
+rows = repmat((1:ny)', 1, 2);
+cols = [(1:ny)' (2:ny+1)'];
+vals = 0.5*beta*lat(:)*dt;
+beta_v_on_u_single_lev = sparse(rows(:), cols(:), repmat(vals,2,1), ny, ny+1);
+Lu_v = kron(beta_v_on_u_single_lev, I26);
+%d(rhou)dz->d(rhov)dz (Coriolis, sparse)
+rows = [ (2:ny)'; (2:ny)'; 1; ny+1 ];
+cols = [ (1:ny-1)'; (2:ny)'; 1; ny ];
+vals_i = -0.5*beta*slat(2:ny)'*dt;
+vals = [vals_i; vals_i; -0.5*beta*slat(1)*dt; -0.5*beta*slat(ny+1)*dt];
+beta_u_on_v_single_lev = sparse(rows, cols, vals, ny+1, ny);
+Lv_u = kron(beta_u_on_v_single_lev, I26);
 %x->d(rhou)dz,d(rhov)dz
-tmp=diag(ggr*rho(1:26)./t_wavebg(1:26))*C(1:26,:);
-Lu_x = -1j*wn_k*kron(eye(ny), tmp)*dt;
-Lv_x = -1.*partial_y_lat_to_slat*kron(eye(ny), tmp)*dt;
+tmp = spdiags(ggr*rho(1:26)./t_wavebg(1:26), 0, 26, 26) * C(1:26,:);
+tmp = sparse(tmp);
+Lu_x = -1j*wn_k*kron(speye(ny), tmp)*dt;
+Lv_x = -partial_y_lat_to_slat*kron(speye(ny), tmp)*dt;
 %d(rhou)dz->d(rhou)dz
-damp_u = damping*eye(ny*26)*epsdt;
+damp_u = damping*speye(ny*26)*epsdt;
 damp_bound_u_single_lev = zeros(ny, 1);
 for i=1:ny
     if abs(lat_deg(i))>=damping_bound_lat
@@ -227,10 +210,9 @@ for i=1:ny
         damp_bound_u_single_lev(i) = pos_coef/damping_bound_time*dt;
     end
 end
-damp_u = damp_u + ...
-         damping_bound * kron(diag(damp_bound_u_single_lev), eye(26));
+damp_u = damp_u + damping_bound * kron(spdiags(damp_bound_u_single_lev, 0, ny, ny), I26);
 %d(rhov)dz->d(rhov)dz
-damp_v = damping*eye(ny*26+26)*epsdt;
+damp_v = damping*speye(ny*26+26)*epsdt;
 damp_bound_v_single_lev = zeros(ny+1, 1);
 for i=1:ny+1
     if abs(slat_deg(i))>=damping_bound_lat
@@ -239,13 +221,12 @@ for i=1:ny+1
         damp_bound_v_single_lev(i) = pos_coef/damping_bound_time*dt;
     end
 end
-damp_v = damp_v + ...
-         damping_bound * kron(diag(damp_bound_v_single_lev), eye(26));
+damp_v = damp_v + damping_bound * kron(spdiags(damp_bound_v_single_lev, 0, ny+1, ny+1), I26);
 % add diffusion
 diff_u = diffusion * nu * dt * ...
-         (-wn_k^2*eye(26*ny) + partial2_y_lat_to_lat);
+         (-wn_k^2*speye(26*ny) + partial2_y_lat_to_lat);
 diff_v = diffusion * nu * dt * ...
-         (-wn_k^2*eye(26*ny+26) + partial2_y_slat_to_slat);
+         (-wn_k^2*speye(26*ny+26) + partial2_y_slat_to_slat);
 
 % 4.3 build the matrix from components
 % option 1: fully explicit (forward)
@@ -254,10 +235,20 @@ diff_v = diffusion * nu * dt * ...
 %     Lv_x, Lv_u, eye(ny*26+26) - damp_v + diff_v];
 % option 2: make it half implicit time-stepping,
 %           forward for state vector, backward for u and v
-MATRIX_LHS = sparse([eye(ny*120, ny*172+26);
-    -Lu_x, eye(ny*26)+damp_u-diff_u, -Lu_v;
-    -Lv_x, -Lv_u, eye(ny*26+26)+damp_v-diff_v]);
-MATRIX_RHS = sparse([Lx_x - damp_x, Lx_u, Lx_v;
-    zeros(ny*52+26, ny*120), eye(ny*52+26)]);
+nx = ny*120; nu = ny*26; nv = (ny+1)*26;
+
+Zxu = sparse(nx, nu);  Zxv = sparse(nx, nv);
+
+MATRIX_LHS = [ ...
+    speye(nx), Zxu, Zxv; ...
+    -Lu_x, speye(nu)+damp_u-diff_u, -Lu_v; ...
+    -Lv_x, -Lv_u, speye(nv)+damp_v-diff_v];
+
+MATRIX_RHS = [ ...
+    Lx_x - damp_x, Lx_u, Lx_v; ...
+    sparse(nu+nv, nx), speye(nu+nv)];
+
 MATRIX = MATRIX_LHS \ MATRIX_RHS;
 % option 3: ???
+
+end
