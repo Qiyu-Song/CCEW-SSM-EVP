@@ -10,17 +10,18 @@ spmd
     iproc = labindex; % get lab ID
     wavenumber_factor = iproc-1;
     dlat = 1;
+    hyperdiff_scale_step = 0.9;   % 0.5 => each step reduces amplitude by half, 1.0 => off
     
     % 1-4 build matrix
     t = tic;
-    [MATRIX, wn_k, lat, lat_deg, z, ny, dt, second] = build_matrix(wavenumber_factor, dlat);
+    [MATRIX, wn_k, lat, lat_deg, z, ny, dt, second] = build_matrix(wavenumber_factor, dlat, hyperdiff_scale_step);
     t_build = toc(t);
     fprintf('wn=%02d | build_matrix: %.2f s\n', wavenumber_factor, t_build);
     
     % 5 eigs
     disp(['Start solving eigenvalues for ' num2str(wavenumber_factor)])
     t = tic;
-    [V, D] = eigs(MATRIX, 172*ny+26);
+    [V, D] = eig(full(MATRIX));
     D = diag(D);
     t_eigs = toc(t);
     fprintf('wn=%02d | eigs: %.2f s\n', wavenumber_factor, t_eigs);
@@ -47,9 +48,10 @@ spmd
     %positive means westward propagation
     D(:,3)=86400*second/dt*angle(D(:,1))/(2*pi);
     disp(['Start saving for ' num2str(wavenumber_factor)])
-    filename=['linear_wave_ssm_results/semi_implicit/bound40_6hr_damp_0_diff_0_wn_' ...
+    filename=['linear_wave_ssm_results/semi_implicit/bound40_6hr_damp_0_diff_0_hydiff_'...
+        num2str(hyperdiff_scale_step, '%.1f') '_wn_' ...
         num2str(wavenumber_factor, '%02d') '_latbnd_60_dlat_' ...
-        num2str(dlat) '_rigidlid'];
+        num2str(dlat) '_rigidlid.mat'];
     spmdsave(filename, wavenumber_factor,wn_k,lat,lat_deg,z,MATRIX,D,V);
     t_save = toc(t);
     fprintf('wn=%02d | save: %.2f s\n', wavenumber_factor, t_save);

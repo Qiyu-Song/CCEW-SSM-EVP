@@ -1,4 +1,4 @@
-function [MATRIX, wn_k, lat, lat_deg, z, ny, dt, second] = build_matrix(wavenumber_factor, dlat)
+function [MATRIX, wn_k, lat, lat_deg, z, ny, dt, second] = build_matrix(wavenumber_factor, dlat, hyperdiff_scale_step)
 
 %% build matrix for the EVP with given parameters
 %current parameters: wavenumber_factor, dlat
@@ -109,6 +109,16 @@ damping_bound_time=14400.*second;
 diffusion=true;
 nu = 0e5 * meter^2 / second;
 
+if nargin < 3 || isempty(hyperdiff_scale_step)
+    hyperdiff_scale_step = 1.0;   % 1.0 => off
+end
+hyperdiff = (hyperdiff_scale_step < 1.0);
+if hyperdiff
+    nu4 = -log(hyperdiff_scale_step)/dt * (dy/pi)^4;   % m^4/s
+else
+    nu4 = 0.0;
+end
+
 %% 4. build the matrix
 % vector        = [ x,   d(rhou)dz, d(rhov)dz(staggered)];
 % vector length = ny*120 + ny*26 + (ny+1)*26
@@ -131,6 +141,15 @@ partial2_y_lat_to_lat   = kron(D2_lat,  I26);
 partial2_y_slat_to_slat = kron(D2_slat, I26);
 partial_y_slat_to_lat   = kron(Dy_s2l,  I26);
 partial_y_lat_to_slat   = kron(Dy_l2s,  I26);
+
+% nu4 hyperdiffusion (sparse)
+% L4 = (d^2/dy^2)^2  on the 1D grids
+D4_lat  = D2_lat  * D2_lat;      % ny x ny, sparse penta-diagonal
+D4_slat = D2_slat * D2_slat;     % (ny+1) x (ny+1), sparse penta-diagonal
+
+% Lift to full space (each vertical level block)
+hdiff_u = hyperdiff * (nu4*dt) * kron(D4_lat,  I26);   % (ny*26) x (ny*26)
+hdiff_v = hyperdiff * (nu4*dt) * kron(D4_slat, I26);   % ((ny+1)*26) x ((ny+1)*26)
 
 %compute w from dudz, dvdz (divergence on lat grid)
 m_to_int_u = -1j*wn_k*speye(26*ny);
@@ -241,8 +260,8 @@ Zxu = sparse(nx, nu);  Zxv = sparse(nx, nv);
 
 MATRIX_LHS = [ ...
     speye(nx), Zxu, Zxv; ...
-    -Lu_x, speye(nu)+damp_u-diff_u, -Lu_v; ...
-    -Lv_x, -Lv_u, speye(nv)+damp_v-diff_v];
+    -Lu_x, speye(nu)+damp_u-diff_u+hdiff_u, -Lu_v; ...
+    -Lv_x, -Lv_u, speye(nv)+damp_v-diff_v+hdiff_v];
 
 MATRIX_RHS = [ ...
     Lx_x - damp_x, Lx_u, Lx_v; ...
