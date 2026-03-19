@@ -10,7 +10,7 @@ spmd
     iproc = labindex; % get lab ID
     wavenumber_factor = iproc-1;
     dlat = 1;
-    hyperdiff_scale_step = 0.9;   % 0.5 => each step reduces amplitude by half, 1.0 => off
+    hyperdiff_scale_step = 0.8;   % 0.5 => each step reduces amplitude by half, 1.0 => off
     
     % 1-4 build matrix
     t = tic;
@@ -48,7 +48,7 @@ spmd
     %positive means westward propagation
     D(:,3)=86400*second/dt*angle(D(:,1))/(2*pi);
     disp(['Start saving for ' num2str(wavenumber_factor)])
-    filename=['linear_wave_ssm_results/semi_implicit/bound40_6hr_damp_0_diff_0_hydiff_'...
+    filename=['linear_wave_ssm_results/test_bc/CNstepping_Neumann_skewsymbeta_bounduvtq30_2hr_0.5_damp_1day_diffxuv_4e4_hydiff_'...
         num2str(hyperdiff_scale_step, '%.1f') '_wn_' ...
         num2str(wavenumber_factor, '%02d') '_latbnd_60_dlat_' ...
         num2str(dlat) '_rigidlid.mat'];

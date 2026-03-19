@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH -J spmd_semiimplicit
-#SBATCH -o out-spmd-semiimplicit
-#SBATCH -e eo-spmd-semiimplicit
+#SBATCH -J spmd_testbc
+#SBATCH -o out-spmd-testbc
+#SBATCH -e eo-spmd-testbc
 #SBATCH -n 1
 #SBATCH -c 41
-#SBATCH -t 1-00:00
+#SBATCH -t 0-12:00
 #SBATCH -p huce_bigmem
 #SBATCH --mem 1500000
 #SBATCH --mail-type=ALL

@@ -1,7 +1,7 @@
 function [MATRIX, wn_k, lat, lat_deg, z, ny, dt, second] = build_matrix(wavenumber_factor, dlat, hyperdiff_scale_step)
 
 %% build matrix for the EVP with given parameters
-%current parameters: wavenumber_factor, dlat
+%current parameters: wavenumber_factor, dlat, hyperdiff_scale_step
 
 %define units
 meter = 1.;
@@ -71,15 +71,20 @@ mw_vec = sqrt([dm(1:26); (2.5^2)*dm(1:14)]);
 mass_weight = spdiags(mw_vec, 0, numel(mw_vec), numel(mw_vec));
 
 % 1.4 meridional grids
-max_lat = 60; % degrees
-lat_deg=-max_lat:dlat:max_lat;
-% staggered grids
-slat_deg=lat_deg-(lat_deg(2)-lat_deg(1))/2;
-slat_deg(end+1)=lat_deg(end)+(lat_deg(2)-lat_deg(1))/2;
-ny=size(lat_deg,2);
-lat=lat_deg*pi/180*RE; % meters
-slat=slat_deg*pi/180*RE;
-dy=lat(2)-lat(1);
+% test_bc: Neumann for all variables
+% boundary value is now on the face centers, lat are cell center
+max_lat = 60; % degrees of boundary latitude for slat
+slat_deg = (-max_lat:dlat:max_lat)';                 % faces (ny+1)
+lat_deg  = 0.5*(slat_deg(1:end-1) + slat_deg(2:end)); % centers (ny)
+ny = numel(lat_deg);
+% interior faces for staggered v (Dirichlet v=0 at boundaries)
+slat_int_deg = slat_deg(2:end-1);                    % (ny-1)
+Nv = numel(slat_int_deg);                            % = ny-1
+
+lat = lat_deg*pi/180*RE;      % meters (centers)
+slat = slat_deg*pi/180*RE;    % meters (faces)
+slat_int = slat(2:end-1);     % meters (interior faces)
+dy = slat(2) - slat(1);        % uniform grid spacing in meters
 
 %% 2. load state space model parameters
 tmp=load('sys_randx2_40_120_free_prediction_estx0_nomean_tabs','sys');
@@ -97,17 +102,18 @@ end
 %% 3. set optional damping and diffusion
 % 3.1 damp U, V, T everywhere
 damping=true;
-eps=0./(86400*second);
+eps=1./(86400*second);
 epsdt=eps*dt;
 
 % 3.2 damp U, V at higher latitudes
-damping_bound=true;
-damping_bound_lat=40.;
-damping_bound_time=14400.*second;
+damping_bound      = true;
+damping_bound_lat  = 30;            % degrees: sponge starts at |lat| >= this
+damping_bound_time = 7200*second;   % seconds: e-folding time at the boundary (e.g. 7200 like test_bc)
+ramp_power         = 0.5;             % 1=linear, 2=quadratic (test_bc uses 2)
 
 % 3.3 add diffusion to U, V in zonal and meridional direction
 diffusion=true;
-nu = 0e5 * meter^2 / second;
+nu_visc = 4e4 * meter^2 / second;
 
 if nargin < 3 || isempty(hyperdiff_scale_step)
     hyperdiff_scale_step = 1.0;   % 1.0 => off
@@ -121,7 +127,7 @@ end
 
 %% 4. build the matrix
 % vector        = [ x,   d(rhou)dz, d(rhov)dz(staggered)];
-% vector length = ny*120 + ny*26 + (ny+1)*26
+% vector length = ny*120 + ny*26 + (ny-1)*26
 %          | x->x,         d(rhou)dz->x,         d(rhov)dz->x         |
 % matrix = | x->d(rhou)dz, d(rhou)dz->d(rhou)dz, d(rhou)dz->d(rhov)dz |
 %          | x->d(rhov)dz, d(rhou)dz->d(rhov)dz, d(rhov)dz->d(rhov)dz |
@@ -130,26 +136,54 @@ disp(['Start building matrix for ' num2str(wavenumber_factor)])
 
 % 4.1 auxiliary matrices (sparse)
 I26 = speye(26);
+I120 = speye(120);
+% 1D meridional operators (sparse, BC-update)
+% lat-grid: ny centers; slat-grid: Nv=ny-1 interior faces
+e_ny = ones(ny,1);
+e_nv = ones(Nv,1);
 
-% 1D meridional operators (sparse, consistent boundary stencils)
-D2_lat  = spdiags([ones(ny,1) -2*ones(ny,1) ones(ny,1)], -1:1, ny, ny) / (dy*dy);
-D2_slat = spdiags([ones(ny+1,1) -2*ones(ny+1,1) ones(ny+1,1)], -1:1, ny+1, ny+1) / (dy*dy);
-Dy_s2l  = spdiags([-ones(ny,1) ones(ny,1)], [0 1], ny, ny+1) / dy;
-Dy_l2s  = spdiags([-ones(ny+1,1) ones(ny+1,1)], [-1 0], ny+1, ny) / dy;
+% second derivative on centers (Neumann-like at boundaries)
+Lyy_lat_single = spdiags([e_ny -2*e_ny e_ny], -1:1, ny, ny) / (dy^2);
+%ghost points has same value, so update BC for Lyy_lat_single
+Lyy_lat_single(1,1) = -1 / (dy^2);
+Lyy_lat_single(ny, ny) = -1 / (dy^2);
 
-partial2_y_lat_to_lat   = kron(D2_lat,  I26);
-partial2_y_slat_to_slat = kron(D2_slat, I26);
-partial_y_slat_to_lat   = kron(Dy_s2l,  I26);
-partial_y_lat_to_slat   = kron(Dy_l2s,  I26);
+% second derivative on interior faces
+Lyy_slat_single = spdiags([e_nv -2*e_nv e_nv], -1:1, Nv, Nv) / (dy^2);
+%ghost points has same value, so update BC for Lyy_slat_single
+Lyy_slat_single(1,1) = -1 / (dy^2);
+Lyy_slat_single(Nv, Nv) = -1 / (dy^2);
 
-% nu4 hyperdiffusion (sparse)
-% L4 = (d^2/dy^2)^2  on the 1D grids
-D4_lat  = D2_lat  * D2_lat;      % ny x ny, sparse penta-diagonal
-D4_slat = D2_slat * D2_slat;     % (ny+1) x (ny+1), sparse penta-diagonal
+% first derivatives
+Dy_s2l_single = spdiags([-e_nv  e_nv], [-1 0], ny, Nv) / dy;
+% if want to enforce zero signal at boundaries, then update BC for Dy_s2l_single
+Dy_s2l_single(1,1) = 0.;
+Dy_s2l_single(ny, Nv) = 0.;
 
-% Lift to full space (each vertical level block)
-hdiff_u = hyperdiff * (nu4*dt) * kron(D4_lat,  I26);   % (ny*26) x (ny*26)
-hdiff_v = hyperdiff * (nu4*dt) * kron(D4_slat, I26);   % ((ny+1)*26) x ((ny+1)*26)
+Dy_l2s_single = spdiags([-e_nv  e_nv], [0 1], Nv, ny) / dy;
+
+% interpolation between grids (for Coriolis coupling)
+slat_to_lat_single = spdiags([0.5*e_nv, 0.5*e_nv], [-1 0], ny, Nv);
+% if want to enforce zero gradient at boundaries, then update BC for slat_to_lat_single
+slat_to_lat_single(1,1) = 1.;
+slat_to_lat_single(ny, Nv) = 1.;
+
+lat_to_slat_single = spdiags([0.5*e_nv 0.5*e_nv], [0 1], Nv, ny);
+
+% lift to full (kron with I26)
+partial2_y_lat_to_lat   = kron(Lyy_lat_single,  I26);
+partial2_y_slat_to_slat = kron(Lyy_slat_single, I26);
+partial_y_slat_to_lat   = kron(Dy_s2l_single,   I26);
+partial_y_lat_to_slat   = kron(Dy_l2s_single,   I26);
+
+slat_to_lat = kron(slat_to_lat_single, I26);
+lat_to_slat = kron(lat_to_slat_single, I26);
+
+% nu4 hyperdiffusion (sparse): (d^2/dy^2)^2
+L4_lat_single  = Lyy_lat_single  * Lyy_lat_single;
+L4_slat_single = Lyy_slat_single * Lyy_slat_single;
+hdiff_u = hyperdiff * (nu4*dt) * kron(L4_lat_single,  I26);   % (ny*26)x(ny*26)
+hdiff_v = hyperdiff * (nu4*dt) * kron(L4_slat_single, I26);   % (Nv*26)x(Nv*26)
 
 %compute w from dudz, dvdz (divergence on lat grid)
 m_to_int_u = -1j*wn_k*speye(26*ny);
@@ -187,6 +221,10 @@ W_v = m_int*m_to_int_v;
 %x->x (memory)
 Lx_x = kron(speye(ny), sparse(A));
 damp_x = damping*kron(speye(ny), sparse(B*C)*epsdt);
+pos = max(0, (abs(lat_deg(:)) - damping_bound_lat) / (max_lat - damping_bound_lat));
+epsdt_lat = (pos.^ramp_power) * (dt / damping_bound_time);   % ny x 1
+damp_x_bound = kron(spdiags(epsdt_lat, 0, ny, ny), sparse(B*C));   % (ny*120)x(ny*120), sparse
+damp_x = damp_x + damp_x_bound;
 %d(rhou)dz,d(rhov)dz->x (input)
 coef_t=t_wavebg(1:26)*0.;
 coef_q=q_wavebg(1:14)*0.;
@@ -201,73 +239,103 @@ trans_w = [speye(26); [speye(14) sparse(14,12)]];
 matrix_1_5 = sparse(B*coef_matrix*trans_w*dt);
 Lx_u = kron(speye(ny), matrix_1_5)*W_u;
 Lx_v = kron(speye(ny), matrix_1_5)*W_v;
-%d(rhov)dz->d(rhou)dz (Coriolis, sparse)
-rows = repmat((1:ny)', 1, 2);
-cols = [(1:ny)' (2:ny+1)'];
-vals = 0.5*beta*lat(:)*dt;
-beta_v_on_u_single_lev = sparse(rows(:), cols(:), repmat(vals,2,1), ny, ny+1);
-Lu_v = kron(beta_v_on_u_single_lev, I26);
-%d(rhou)dz->d(rhov)dz (Coriolis, sparse)
-rows = [ (2:ny)'; (2:ny)'; 1; ny+1 ];
-cols = [ (1:ny-1)'; (2:ny)'; 1; ny ];
-vals_i = -0.5*beta*slat(2:ny)'*dt;
-vals = [vals_i; vals_i; -0.5*beta*slat(1)*dt; -0.5*beta*slat(ny+1)*dt];
-beta_u_on_v_single_lev = sparse(rows, cols, vals, ny+1, ny);
-Lv_u = kron(beta_u_on_v_single_lev, I26);
+%d(rhov)dz->d(rhou)dz and d(rhou)dz->d(rhov)dz (Coriolis, sparse; BC-update)
+% f = beta * y, evaluated on centers and interior faces
+%f_lat  = beta * lat(:);        % (ny)
+%f_slat = beta * slat_int(:);   % (Nv)
+%Fu = kron(spdiags(f_lat,  0, ny, ny), I26) * dt;
+%Fv = kron(spdiags(f_slat, 0, Nv, Nv), I26) * dt;
+%Lu_v = Fu * slat_to_lat;
+%Lv_u = -Fv * lat_to_slat;
+
+% make Coriolis terms skew-symmetric to avoid spurious growth from Coriolis coupling
+f_slat = beta * slat_int(:);                 % interior faces
+F_big  = kron(spdiags(f_slat,0,Nv,Nv), I26) * dt;
+
+Lu_v = slat_to_lat * F_big;                  % (ny*26) x (Nv*26)
+Lv_u = -F_big * lat_to_slat;                 % (Nv*26) x (ny*26)
+
+
 %x->d(rhou)dz,d(rhov)dz
 tmp = spdiags(ggr*rho(1:26)./t_wavebg(1:26), 0, 26, 26) * C(1:26,:);
 tmp = sparse(tmp);
 Lu_x = -1j*wn_k*kron(speye(ny), tmp)*dt;
 Lv_x = -partial_y_lat_to_slat*kron(speye(ny), tmp)*dt;
-%d(rhou)dz->d(rhou)dz
+%d(rhou)dz->d(rhou)dz and %d(rhov)dz->d(rhov)dz
 damp_u = damping*speye(ny*26)*epsdt;
-damp_bound_u_single_lev = zeros(ny, 1);
-for i=1:ny
-    if abs(lat_deg(i))>=damping_bound_lat
-        pos_coef = (abs(lat_deg(i))-damping_bound_lat) / ...
-                    (max_lat - damping_bound_lat);
-        damp_bound_u_single_lev(i) = pos_coef/damping_bound_time*dt;
-    end
-end
+damp_v = damping*speye(Nv*26)*epsdt;
+
+% --- high-lat damping for u(lat) and v(slat interior) only (test_bc style, ramp^2) ---
+% u lives on lat_deg (ny centers), v lives on slat_int_deg (Nv = ny-1 interior faces)
+pos_u = max(0, (abs(lat_deg(:)) - damping_bound_lat) / (max_lat - damping_bound_lat));
+damp_bound_u_single_lev = pos_u.^ramp_power / damping_bound_time * dt;    % (ny,1)
+pos_v = max(0, (abs(slat_int_deg(:)) - damping_bound_lat) / (max_lat - damping_bound_lat));
+damp_bound_v_single_lev = pos_v.^ramp_power / damping_bound_time * dt;    % (Nv,1)
+
+% add to existing damp_u/damp_v (both sparse)
 damp_u = damp_u + damping_bound * kron(spdiags(damp_bound_u_single_lev, 0, ny, ny), I26);
-%d(rhov)dz->d(rhov)dz
-damp_v = damping*speye(ny*26+26)*epsdt;
-damp_bound_v_single_lev = zeros(ny+1, 1);
-for i=1:ny+1
-    if abs(slat_deg(i))>=damping_bound_lat
-        pos_coef = (abs(slat_deg(i))-damping_bound_lat) / ...
-                   (max_lat - damping_bound_lat);
-        damp_bound_v_single_lev(i) = pos_coef/damping_bound_time*dt;
-    end
-end
-damp_v = damp_v + damping_bound * kron(spdiags(damp_bound_v_single_lev, 0, ny+1, ny+1), I26);
+damp_v = damp_v + damping_bound * kron(spdiags(damp_bound_v_single_lev, 0, Nv, Nv), I26);
+
 % add diffusion
-diff_u = diffusion * nu * dt * ...
+partial2_y_x = kron(Lyy_lat_single, I120);   % (ny*120) x (ny*120), sparse
+diff_x = diffusion * nu_visc * dt * ...
+         (-wn_k^2*speye(120*ny) + partial2_y_x);
+diff_u = diffusion * nu_visc * dt * ...
          (-wn_k^2*speye(26*ny) + partial2_y_lat_to_lat);
-diff_v = diffusion * nu * dt * ...
-         (-wn_k^2*speye(26*ny+26) + partial2_y_slat_to_slat);
+diff_v = diffusion * nu_visc * dt * ...
+         (-wn_k^2*speye(26*Nv) + partial2_y_slat_to_slat);
 
 % 4.3 build the matrix from components
 % option 1: fully explicit (forward)
 % MATRIX = [Lx_x - damp_x, Lx_u, Lx_v;
 %     Lu_x, eye(ny*26) - damp_u + diff_u, Lu_v;
-%     Lv_x, Lv_u, eye(ny*26+26) - damp_v + diff_v];
+%     Lv_x, Lv_u, eye(Nv*26) - damp_v + diff_v];
 % option 2: make it half implicit time-stepping,
 %           forward for state vector, backward for u and v
-nx = ny*120; nu = ny*26; nv = (ny+1)*26;
+% nx = ny*120; nu_dim = ny*26; nv_dim = Nv*26;
+% 
+% Zxu = sparse(nx, nu_dim);  Zxv = sparse(nx, nv_dim);
+% 
+% MATRIX_LHS = [ ...
+%     speye(nx), Zxu, Zxv; ...
+%     -Lu_x, speye(nu_dim)+damp_u-diff_u+hdiff_u, -Lu_v; ...
+%     -Lv_x, -Lv_u, speye(nv_dim)+damp_v-diff_v+hdiff_v];
+% 
+% MATRIX_RHS = [ ...
+%     Lx_x - damp_x, Lx_u, Lx_v; ...
+%     sparse(nu_dim+nv_dim, nx), speye(nu_dim+nv_dim)];
+% 
+% MATRIX = MATRIX_LHS \ MATRIX_RHS;
+% option 3: --- CN/Cayley-style step mapping (test_bc style), keeping your block names ---
+nx = ny*120; nu_dim = ny*26; nv_dim = Nv*26;
 
-Zxu = sparse(nx, nu);  Zxv = sparse(nx, nv);
+Zxu = sparse(nx, nu_dim);  Zxv = sparse(nx, nv_dim);
+Zux = sparse(nu_dim, nx);  Zuv = sparse(nu_dim, nv_dim);
+Zvx = sparse(nv_dim, nx);  Zvu = sparse(nv_dim, nu_dim);
 
-MATRIX_LHS = [ ...
-    speye(nx), Zxu, Zxv; ...
-    -Lu_x, speye(nu)+damp_u-diff_u+hdiff_u, -Lu_v; ...
-    -Lv_x, -Lv_u, speye(nv)+damp_v-diff_v+hdiff_v];
+I  = speye(nx + nu_dim + nv_dim);
+Ix = speye(nx);
 
-MATRIX_RHS = [ ...
-    Lx_x - damp_x, Lx_u, Lx_v; ...
-    sparse(nu+nv, nx), speye(nu+nv)];
+% Wave-coupling operator (off-diagonal only)
+R_wave = [ ...
+    sparse(nx,nx),  Lx_u,  Lx_v; ...
+    Lu_x,           sparse(nu_dim,nu_dim),  Lu_v; ...
+    Lv_x,           Lv_u,  sparse(nv_dim,nv_dim)];
 
-MATRIX = MATRIX_LHS \ MATRIX_RHS;
-% option 3: ???
+% Dissipation (placed on RHS, like test_bc)
+% NOTE: your LHS-form used +damp -diff +hdiff. Here we add tendencies:
+%   -damp  + diff  - hdiff   (hdiff_u/v are positive semidefinite as you defined them)
+DISS = blkdiag( ...
+    -damp_x + diff_x, ...
+    (-damp_u + diff_u - hdiff_u), ...
+    (-damp_v + diff_v - hdiff_v) );
+
+% Put the discrete x-step Lx_x into RHS (since it's already a one-step map)
+SSM_step = blkdiag(Lx_x - Ix, sparse(nu_dim+nv_dim, nu_dim+nv_dim));
+
+LHS = I - 0.5 * R_wave;
+RHS = I + 0.5 * R_wave + DISS + SSM_step;
+
+MATRIX = LHS \ RHS;
 
 end
