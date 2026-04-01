@@ -1,4 +1,7 @@
-function [MATRIX, wn_k, lat, lat_deg, z, ny, dt, second] = build_matrix(wavenumber_factor, dlat, hyperdiff_scale_step)
+function [MATRIX, wn_k, lat, lat_deg, z, ny, dt, second] = build_matrix(wavenumber_factor, opt)
+
+if nargin < 2 || isempty(opt); opt = struct(); end
+opt = fill_defaults(opt);
 
 %% build matrix for the EVP with given parameters
 %current parameters: wavenumber_factor, dlat, hyperdiff_scale_step
@@ -73,7 +76,8 @@ mass_weight = spdiags(mw_vec, 0, numel(mw_vec), numel(mw_vec));
 % 1.4 meridional grids
 % test_bc: Neumann for all variables
 % boundary value is now on the face centers, lat are cell center
-max_lat = 60; % degrees of boundary latitude for slat
+max_lat = opt.max_lat; % degrees of boundary latitude for slat
+dlat = opt.dlat; % degrees of grid spacing
 slat_deg = (-max_lat:dlat:max_lat)';                 % faces (ny+1)
 lat_deg  = 0.5*(slat_deg(1:end-1) + slat_deg(2:end)); % centers (ny)
 ny = numel(lat_deg);
@@ -101,23 +105,20 @@ end
 
 %% 3. set optional damping and diffusion
 % 3.1 damp U, V, T everywhere
-damping=true;
-eps=1./(86400*second);
-epsdt=eps*dt;
+damping = opt.damping.enable;
+epsdt   = (dt/(opt.damping.tau_day*86400)) * double(damping);
 
 % 3.2 damp U, V at higher latitudes
-damping_bound      = true;
-damping_bound_lat  = 30;            % degrees: sponge starts at |lat| >= this
-damping_bound_time = 7200*second;   % seconds: e-folding time at the boundary (e.g. 7200 like test_bc)
-ramp_power         = 0.5;             % 1=linear, 2=quadratic (test_bc uses 2)
+damping_bound      = opt.sponge.enable;
+damping_bound_lat  = opt.sponge.lat0_deg;           % degrees: sponge starts at |lat| >= this
+damping_bound_time = opt.sponge.tau_hr*3600*second; % seconds: e-folding time at the boundary (e.g. 7200 like test_bc)
+ramp_power         = opt.sponge.ramp_power;         % 1=linear, 2=quadratic
 
 % 3.3 add diffusion to U, V in zonal and meridional direction
-diffusion=true;
-nu_visc = 4e4 * meter^2 / second;
+diffusion=opt.diffusion.enable;
+nu_visc = opt.diffusion.nu_visc * meter^2 / second;
 
-if nargin < 3 || isempty(hyperdiff_scale_step)
-    hyperdiff_scale_step = 1.0;   % 1.0 => off
-end
+hyperdiff_scale_step = opt.hyperdiff.scale_step;
 hyperdiff = (hyperdiff_scale_step < 1.0);
 if hyperdiff
     nu4 = -log(hyperdiff_scale_step)/dt * (dy/pi)^4;   % m^4/s
@@ -277,9 +278,11 @@ damp_u = damp_u + damping_bound * kron(spdiags(damp_bound_u_single_lev, 0, ny, n
 damp_v = damp_v + damping_bound * kron(spdiags(damp_bound_v_single_lev, 0, Nv, Nv), I26);
 
 % add diffusion
-partial2_y_x = kron(Lyy_lat_single, I120);   % (ny*120) x (ny*120), sparse
-diff_x = diffusion * nu_visc * dt * ...
-         (-wn_k^2*speye(120*ny) + partial2_y_x);
+%partial2_y_x = kron(Lyy_lat_single, I120);   % (ny*120) x (ny*120), sparse
+%diff_x = diffusion * nu_visc * dt * ...
+%         (-wn_k^2*speye(120*ny) + partial2_y_x);
+Dlat = (-wn_k^2*speye(ny) + Lyy_lat_single);
+diff_x = diffusion * nu_visc * dt * kron(Dlat, sparse(B*C));
 diff_u = diffusion * nu_visc * dt * ...
          (-wn_k^2*speye(26*ny) + partial2_y_lat_to_lat);
 diff_v = diffusion * nu_visc * dt * ...
@@ -287,55 +290,95 @@ diff_v = diffusion * nu_visc * dt * ...
 
 % 4.3 build the matrix from components
 % option 1: fully explicit (forward)
-% MATRIX = [Lx_x - damp_x, Lx_u, Lx_v;
-%     Lu_x, eye(ny*26) - damp_u + diff_u, Lu_v;
-%     Lv_x, Lv_u, eye(Nv*26) - damp_v + diff_v];
+if opt.stepper == "forward"
+    MATRIX = [...
+        Lx_x + diff_x - damp_x, Lx_u, Lx_v;
+        Lu_x, eye(ny*26) + diff_u - damp_u - hdiff_u, Lu_v;
+        Lv_x, Lv_u, eye(Nv*26) + diff_v - damp_v - hdiff_v];
 % option 2: make it half implicit time-stepping,
 %           forward for state vector, backward for u and v
-% nx = ny*120; nu_dim = ny*26; nv_dim = Nv*26;
-% 
-% Zxu = sparse(nx, nu_dim);  Zxv = sparse(nx, nv_dim);
-% 
-% MATRIX_LHS = [ ...
-%     speye(nx), Zxu, Zxv; ...
-%     -Lu_x, speye(nu_dim)+damp_u-diff_u+hdiff_u, -Lu_v; ...
-%     -Lv_x, -Lv_u, speye(nv_dim)+damp_v-diff_v+hdiff_v];
-% 
-% MATRIX_RHS = [ ...
-%     Lx_x - damp_x, Lx_u, Lx_v; ...
-%     sparse(nu_dim+nv_dim, nx), speye(nu_dim+nv_dim)];
-% 
-% MATRIX = MATRIX_LHS \ MATRIX_RHS;
+elseif opt.stepper == "semi-implicit"
+    nx = ny*120; nu_dim = ny*26; nv_dim = Nv*26;
+    Zxu = sparse(nx, nu_dim);  Zxv = sparse(nx, nv_dim);
+    MATRIX_LHS = [ ...
+        speye(nx), Zxu, Zxv; ...
+        -Lu_x, speye(nu_dim)+damp_u-diff_u+hdiff_u, -Lu_v; ...
+        -Lv_x, -Lv_u, speye(nv_dim)+damp_v-diff_v+hdiff_v];
+    MATRIX_RHS = [ ...
+        Lx_x - damp_x+diff_x, Lx_u, Lx_v; ...
+        sparse(nu_dim+nv_dim, nx), speye(nu_dim+nv_dim)];
+    MATRIX = MATRIX_LHS \ MATRIX_RHS;
 % option 3: --- CN/Cayley-style step mapping (test_bc style), keeping your block names ---
-nx = ny*120; nu_dim = ny*26; nv_dim = Nv*26;
+elseif opt.stepper == "CN"
+    nx = ny*120; nu_dim = ny*26; nv_dim = Nv*26;
 
-Zxu = sparse(nx, nu_dim);  Zxv = sparse(nx, nv_dim);
-Zux = sparse(nu_dim, nx);  Zuv = sparse(nu_dim, nv_dim);
-Zvx = sparse(nv_dim, nx);  Zvu = sparse(nv_dim, nu_dim);
+    Zxu = sparse(nx, nu_dim);  Zxv = sparse(nx, nv_dim);
+    Zux = sparse(nu_dim, nx);  Zuv = sparse(nu_dim, nv_dim);
+    Zvx = sparse(nv_dim, nx);  Zvu = sparse(nv_dim, nu_dim);
 
-I  = speye(nx + nu_dim + nv_dim);
-Ix = speye(nx);
+    I  = speye(nx + nu_dim + nv_dim);
+    Ix = speye(nx);
 
-% Wave-coupling operator (off-diagonal only)
-R_wave = [ ...
-    sparse(nx,nx),  Lx_u,  Lx_v; ...
-    Lu_x,           sparse(nu_dim,nu_dim),  Lu_v; ...
-    Lv_x,           Lv_u,  sparse(nv_dim,nv_dim)];
+    % Wave-coupling operator (off-diagonal only)
+    R_wave = [ ...
+        sparse(nx,nx),  Lx_u,  Lx_v; ...
+        Lu_x,           sparse(nu_dim,nu_dim),  Lu_v; ...
+        Lv_x,           Lv_u,  sparse(nv_dim,nv_dim)];
 
-% Dissipation (placed on RHS, like test_bc)
-% NOTE: your LHS-form used +damp -diff +hdiff. Here we add tendencies:
-%   -damp  + diff  - hdiff   (hdiff_u/v are positive semidefinite as you defined them)
-DISS = blkdiag( ...
-    -damp_x + diff_x, ...
-    (-damp_u + diff_u - hdiff_u), ...
-    (-damp_v + diff_v - hdiff_v) );
+    % Dissipation (placed on RHS, like test_bc)
+    % NOTE: your LHS-form used +damp -diff +hdiff. Here we add tendencies:
+    %   -damp  + diff  - hdiff   (hdiff_u/v are positive semidefinite as you defined them)
+    DISS = blkdiag( ...
+        -damp_x + diff_x, ...
+        (-damp_u + diff_u - hdiff_u), ...
+        (-damp_v + diff_v - hdiff_v) );
 
-% Put the discrete x-step Lx_x into RHS (since it's already a one-step map)
-SSM_step = blkdiag(Lx_x - Ix, sparse(nu_dim+nv_dim, nu_dim+nv_dim));
+    % Put the discrete x-step Lx_x into RHS (since it's already a one-step map)
+    SSM_step = blkdiag(Lx_x - Ix, sparse(nu_dim+nv_dim, nu_dim+nv_dim));
 
-LHS = I - 0.5 * R_wave;
-RHS = I + 0.5 * R_wave + DISS + SSM_step;
+    LHS = I - 0.5 * R_wave;
+    RHS = I + 0.5 * R_wave + DISS + SSM_step;
 
-MATRIX = LHS \ RHS;
+    MATRIX = LHS \ RHS;
+else
+    error("Unknown stepper type: " + opt.stepper);
 
+end
+
+
+function opt = fill_defaults(opt)
+opt = def(opt, "dlat", 2);
+opt = def(opt, "max_lat", 60);
+
+opt = def(opt, "stepper", "CN");
+
+if ~isfield(opt,"bc"); opt.bc = struct(); end
+opt.bc = def(opt.bc, "upper", "rigidlid");
+opt.bc = def(opt.bc, "merid", "Neumann");
+
+if ~isfield(opt,"damping"); opt.damping = struct(); end
+opt.damping = def(opt.damping, "enable", true);
+opt.damping = def(opt.damping, "tau_day", 1);
+
+if ~isfield(opt,"sponge"); opt.sponge = struct(); end
+opt.sponge = def(opt.sponge, "enable", true);
+opt.sponge = def(opt.sponge, "lat0_deg", 30);
+opt.sponge = def(opt.sponge, "tau_hr", 2);
+opt.sponge = def(opt.sponge, "ramp_power", 2);
+
+if ~isfield(opt,"diffusion"); opt.diffusion = struct(); end
+opt.diffusion = def(opt.diffusion, "enable", true);
+opt.diffusion = def(opt.diffusion, "nu_visc", 4e4);
+
+if ~isfield(opt,"hyperdiff"); opt.hyperdiff = struct(); end
+opt.hyperdiff = def(opt.hyperdiff, "scale_step", 1.0);
+
+opt = def(opt, "out_root", "linear_wave_ssm_results");
+opt = def(opt, "out_case", "test_bc");
+end
+
+function s = def(s, field, val)
+if ~isfield(s, field) || isempty(s.(field))
+    s.(field) = val;
+end
 end
